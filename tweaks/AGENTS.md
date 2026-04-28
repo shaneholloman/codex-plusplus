@@ -246,6 +246,68 @@ Codex++ watches your tweak folder and reloads on save. Don't add your own
 file watcher — `start()` will simply be re-invoked. Use `stop()` to undo any
 DOM mutations / IPC handlers / event listeners.
 
+## Inspecting the live DOM (Chrome DevTools Protocol)
+
+When you're authoring a tweak, you almost always need to know Codex's
+real markup — class names, structure, computed styles. The Codex++
+runtime can expose Electron's renderer over CDP so you (or an AI agent)
+can probe and mutate it from the host shell without clicking around.
+
+**Enable it:**
+
+```sh
+CODEXPP_REMOTE_DEBUG=1 open -a Codex
+# default port 9222 — override with CODEXPP_REMOTE_DEBUG_PORT=NNNN
+```
+
+The switch is wired in at `packages/runtime/src/main.ts` and is **off by
+default**. Only turn it on for development.
+
+**List targets:**
+
+```sh
+curl -s http://localhost:9222/json | jq '.[] | {id, type, url}'
+```
+
+You want the one with `"type": "page"` and `url: "app://-/index.html?..."`.
+
+**Probe / evaluate JS** (no extra deps — Node 18+ has `WebSocket`):
+
+```js
+const tabs = await (await fetch('http://localhost:9222/json')).json();
+const tab  = tabs.find(t => t.type === 'page');
+const ws   = new WebSocket(tab.webSocketDebuggerUrl);
+let id = 0;
+const send = (method, params = {}) => new Promise(r => {
+  const i = ++id;
+  const h = e => { const m = JSON.parse(e.data); if (m.id === i) { ws.removeEventListener('message', h); r(m); } };
+  ws.addEventListener('message', h);
+  ws.send(JSON.stringify({ id: i, method, params }));
+});
+await new Promise(r => ws.addEventListener('open', r, { once: true }));
+await send('Runtime.enable');
+const r = await send('Runtime.evaluate', {
+  expression: `document.querySelectorAll('aside').length`,
+  returnByValue: true,
+});
+console.log(r.result.result.value);
+ws.close();
+```
+
+**Common methods:**
+
+- `Runtime.evaluate` — run any expression, get a value back. Best tool for
+  reading computed styles, dumping `outerHTML`, counting elements.
+- `Page.reload` — full renderer refresh; re-runs the preload. Equivalent
+  to clicking **Force Reload** in the Tweaks page.
+- `Page.captureScreenshot` — grab a PNG to verify visual changes.
+- `Input.dispatchKeyEvent` — keyboard simulation. **Note:** macOS menu
+  accelerators (e.g. `Cmd+,`) are unreliable through this; have the user
+  open menus manually.
+
+When iterating: write a small probe script under `/tmp/probe-*.mjs`,
+make a change, rebuild + stage the runtime, `Page.reload`, re-probe.
+
 ## Don'ts
 
 - ❌ Don't import React directly — Codex's React isn't a stable dependency.
