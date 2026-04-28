@@ -614,10 +614,16 @@ function renderTweaksPage(sectionsWrap: HTMLElement): void {
     void ipcRenderer.invoke("codexpp:reveal", tweaksPath());
   });
   const reloadBtn = openInPlaceButton("Force Reload", () => {
-    // The reload broadcast will re-fetch the list and re-render this page.
-    void ipcRenderer.invoke("codexpp:reload-tweaks").catch((e) => {
-      plog("force reload failed", String(e));
-    });
+    // Full page refresh — same as DevTools Cmd-R / our CDP Page.reload.
+    // Main re-discovers tweaks first so the new renderer comes up with a
+    // fresh tweak set; then location.reload restarts the renderer so the
+    // preload re-initializes against it.
+    void ipcRenderer
+      .invoke("codexpp:reload-tweaks")
+      .catch((e) => plog("force reload (main) failed", String(e)))
+      .finally(() => {
+        location.reload();
+      });
   });
   // Drop the diagonal-arrow icon from the reload button — it implies "open
   // out of app" which doesn't fit. Replace its trailing svg with a refresh.
@@ -690,7 +696,9 @@ function tweakRow(t: ListedTweak, sections: SettingsSection[]): HTMLElement {
   // ── Avatar ─────────────────────────────────────────────────────────────
   const avatar = document.createElement("div");
   avatar.className =
-    "flex size-24 shrink-0 items-center justify-center rounded-md border border-token-border overflow-hidden text-token-text-secondary";
+    "flex shrink-0 items-center justify-center rounded-md border border-token-border overflow-hidden text-token-text-secondary";
+  avatar.style.width = "56px";
+  avatar.style.height = "56px";
   avatar.style.backgroundColor = "var(--color-token-bg-fog, transparent)";
   if (m.iconUrl) {
     const img = document.createElement("img");
@@ -699,7 +707,7 @@ function tweakRow(t: ListedTweak, sections: SettingsSection[]): HTMLElement {
     // Initial: show fallback initial in case the icon fails to load.
     const initial = (m.name?.[0] ?? "?").toUpperCase();
     const fallback = document.createElement("span");
-    fallback.className = "text-3xl font-medium";
+    fallback.className = "text-xl font-medium";
     fallback.textContent = initial;
     avatar.appendChild(fallback);
     img.style.display = "none";
@@ -718,7 +726,7 @@ function tweakRow(t: ListedTweak, sections: SettingsSection[]): HTMLElement {
   } else {
     const initial = (m.name?.[0] ?? "?").toUpperCase();
     const span = document.createElement("span");
-    span.className = "text-3xl font-medium";
+    span.className = "text-xl font-medium";
     span.textContent = initial;
     avatar.appendChild(span);
   }
