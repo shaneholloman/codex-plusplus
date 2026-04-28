@@ -1,0 +1,103 @@
+# Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                                Codex.app                                │
+│  Contents/Resources/                                                    │
+│  ├─ app.asar                                                            │
+│  │   ├─ package.json   (main: codex-plusplus-loader.cjs)  ◄─ patched   │
+│  │   ├─ codex-plusplus-loader.cjs                          ◄─ injected │
+│  │   └─ <original Codex code …>                                         │
+│  ├─ Frameworks/Electron Framework.framework/.../Electron Framework      │
+│  │   └─ fuse: EnableEmbeddedAsarIntegrityValidation = off  ◄─ patched  │
+│  └─ Info.plist                                                          │
+│      └─ ElectronAsarIntegrity["Resources/app.asar"] = <new hash>  ◄─   │
+└────────────────────────────────────────────────────────────────────────┘
+                                 │
+                  loader.cjs requires runtime/main.js
+                                 ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  <user-data-dir>/codex-plusplus/                                        │
+│  ├─ runtime/                                                            │
+│  │   ├─ main.js          — main process; hooks BrowserWindow            │
+│  │   ├─ preload.js       — bundled preload (renderer side)              │
+│  │   └─ tweak-discovery.js                                              │
+│  ├─ tweaks/                                                             │
+│  │   └─ <tweak-id>/                                                     │
+│  │       ├─ manifest.json                                               │
+│  │       └─ index.js                                                    │
+│  ├─ tweak-data/<tweak-id>/   — per-tweak filesystem sandbox             │
+│  ├─ backup/                  — original asar / plist / framework binary │
+│  ├─ log/                                                                │
+│  ├─ state.json               — installer records                        │
+│  └─ config.json              — user preferences (enable flags etc.)     │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+## Boot sequence
+
+1. User launches Codex.app.
+2. macOS verifies the (re-signed) ad-hoc signature → Gatekeeper allows launch.
+3. Electron reads `Info.plist` → checks asar integrity hash.
+   - The hash now matches the patched asar, so this passes.
+   - As belt-and-suspenders the `EnableEmbeddedAsarIntegrityValidation` fuse is off too.
+4. Electron loads the asar's `package.json#main`, which now points to `codex-plusplus-loader.cjs`.
+5. The loader (in the asar):
+   - Reads `__codexpp.userRoot` from package.json.
+   - Sets `CODEX_PLUSPLUS_USER_ROOT` and `CODEX_PLUSPLUS_RUNTIME` envs.
+   - `require()`s `<userRoot>/runtime/main.js`.
+   - `require()`s the original `__codexpp.originalMain` (Codex's real entry).
+6. Runtime's `main.js`:
+   - Registers our preload via `session.setPreloads()` (additive — Codex's own preload still runs).
+   - Discovers tweaks under `<userRoot>/tweaks`.
+   - Starts main-scoped tweaks immediately.
+   - Sets up IPC handlers.
+7. Codex creates its `BrowserWindow`. Both Codex's preload AND our preload run in each renderer.
+8. Our preload:
+   - Installs a React DevTools-shaped global hook (so we can fiber-walk later).
+   - Asks main for the tweak list and user paths over IPC.
+   - For each renderer-scoped tweak, `require()`s its entry and calls `start(api)`.
+   - Starts the Settings injector (MutationObserver waiting for the Settings dialog).
+   - Mounts the built-in Tweak Manager section.
+9. When the user opens Settings, our injector:
+   - Detects the Radix `[role="dialog"]` matching "Settings".
+   - Appends a "Tweaks" tab to the dialog's `[role="tablist"]`.
+   - Creates a sibling content panel that shows registered sections when the tab is clicked, and hides itself when other tabs are clicked.
+
+## Why these choices
+
+### Why patch asar entry instead of always using the fuse?
+
+The fuse alone would let us swap in a new asar, but Codex's asar is large (~115 MB) — pointlessly recopying it every install/update is slow. Patching the entry adds ~1 KB. We do flip the fuse anyway as a safety net: if a future Codex update brings asar integrity back via a different mechanism, the fuse still neutralizes it.
+
+### Why ad-hoc re-sign instead of disabling SIP?
+
+Re-signing is local-only, reversible, and doesn't compromise system security. Ad-hoc signatures are accepted by Gatekeeper for apps the user already approved. We never touch SIP, hardened runtime, or kernel-level protections.
+
+### Why a preload, not source-patching the React tree?
+
+Codex is a Vite/Rollup build with a single entry chunk and no module registry exposed at runtime — there's no `webpackChunk` trick. String-patching the minified output is brittle (every Codex release changes the build). Preload + DOM observation is decoupled from Codex's bundle structure: we only depend on stable affordances (Radix attributes, `[role="dialog"]`, etc.), so most Codex updates just work.
+
+### Why a separate runtime in user-dir?
+
+So you can iterate on tweaks (and even on the runtime itself) without re-running the installer. The installer's job is the one-time "punch a hole in the bundle"; everything else lives outside.
+
+### Why `session.setPreloads()` instead of `webPreferences.preload`?
+
+`webPreferences.preload` is a single string; setting it would replace Codex's own preload and break the app. `session.setPreloads()` is *additive* — it appends to whatever the renderer already has. Available since Electron 23+.
+
+## Update handling
+
+When Codex auto-updates via Sparkle:
+
+1. Sparkle downloads a new Codex.app and replaces ours on disk.
+2. Our patch is gone; the new app launches normally.
+3. Our launchd / systemd / scheduled-task watcher fires (it watches `app.asar` for changes).
+4. The watcher runs `codex-plusplus doctor`, which detects the asar hash matches `originalAsarHash` of the *previous* version (i.e., it's no longer patched) and exits non-zero.
+5. (Future) `doctor` surfaces a desktop notification linking the user to `codex-plusplus repair`. Right now you re-run it manually.
+
+## What's not protected against
+
+- **A Codex update that changes the asar layout** (e.g., moves the entry script) will break our injection. The installer's `injectLoader` reads `package.json#main` so this should be robust to renames, but if Codex ever ships an executable that doesn't go through Electron's normal asar-loading path, we'd need new strategies.
+- **A Codex update that changes the Settings DOM enough that our heuristics fail.** The runtime falls back to a console warning; tweak authors can register sections that simply don't appear until heuristics are updated.
+- **Targeted anti-tamper.** Codex doesn't currently appear to do TOCTOU integrity re-checks at runtime. If they ever start, more work is required (LD hooks, MachO patching, etc.) — but this is a different threat model.

@@ -1,0 +1,466 @@
+/**
+ * Main-process bootstrap. Loaded by the asar loader before Codex's own
+ * main process code runs. We hook `BrowserWindow` so every window Codex
+ * creates gets our preload script attached. We also stand up an IPC
+ * channel for tweaks to talk to the main process.
+ *
+ * We are in CJS land here (matches Electron's main process and Codex's own
+ * code). The renderer-side runtime is bundled separately into preload.js.
+ */
+import { app, BrowserWindow, ipcMain, session, shell, webContents } from "electron";
+import { existsSync, mkdirSync, appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import chokidar from "chokidar";
+import { discoverTweaks, type DiscoveredTweak } from "./tweak-discovery";
+import { createDiskStorage, type DiskStorage } from "./storage";
+
+const userRoot = process.env.CODEX_PLUSPLUS_USER_ROOT;
+const runtimeDir = process.env.CODEX_PLUSPLUS_RUNTIME;
+
+if (!userRoot || !runtimeDir) {
+  throw new Error(
+    "codex-plusplus runtime started without CODEX_PLUSPLUS_USER_ROOT/RUNTIME envs",
+  );
+}
+
+const PRELOAD_PATH = resolve(runtimeDir, "preload.js");
+const TWEAKS_DIR = join(userRoot, "tweaks");
+const LOG_DIR = join(userRoot, "log");
+const LOG_FILE = join(LOG_DIR, "main.log");
+const STATE_FILE = join(userRoot, "state.json");
+
+mkdirSync(LOG_DIR, { recursive: true });
+mkdirSync(TWEAKS_DIR, { recursive: true });
+
+interface PersistedState {
+  /** Per-tweak enable flags. Missing entries default to enabled. */
+  tweaks?: Record<string, { enabled?: boolean }>;
+}
+
+function readState(): PersistedState {
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, "utf8")) as PersistedState;
+  } catch {
+    return {};
+  }
+}
+function writeState(s: PersistedState): void {
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+  } catch (e) {
+    log("warn", "writeState failed:", String((e as Error).message));
+  }
+}
+function isTweakEnabled(id: string): boolean {
+  const s = readState();
+  return s.tweaks?.[id]?.enabled !== false;
+}
+function setTweakEnabled(id: string, enabled: boolean): void {
+  const s = readState();
+  s.tweaks ??= {};
+  s.tweaks[id] = { ...s.tweaks[id], enabled };
+  writeState(s);
+}
+
+function log(level: "info" | "warn" | "error", ...args: unknown[]): void {
+  const line = `[${new Date().toISOString()}] [${level}] ${args
+    .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
+    .join(" ")}\n`;
+  try {
+    appendFileSync(LOG_FILE, line);
+  } catch {}
+  if (level === "error") console.error("[codex-plusplus]", ...args);
+}
+
+// Surface unhandled errors from anywhere in the main process to our log.
+process.on("uncaughtException", (e: Error & { code?: string }) => {
+  log("error", "uncaughtException", { code: e.code, message: e.message, stack: e.stack });
+});
+process.on("unhandledRejection", (e) => {
+  log("error", "unhandledRejection", { value: String(e) });
+});
+
+interface LoadedMainTweak {
+  stop?: () => void;
+  storage: DiskStorage;
+}
+
+const tweakState = {
+  discovered: [] as DiscoveredTweak[],
+  loadedMain: new Map<string, LoadedMainTweak>(),
+};
+
+// 1. Hook every session so our preload runs in every renderer.
+//
+// We use Electron's modern `session.registerPreloadScript` API (added in
+// Electron 35). The deprecated `setPreloads` path silently no-ops in some
+// configurations (notably with sandboxed renderers), so registerPreloadScript
+// is the only reliable way to inject into Codex's BrowserWindows.
+function registerPreload(s: Electron.Session, label: string): void {
+  try {
+    const reg = (s as unknown as {
+      registerPreloadScript?: (opts: {
+        type?: "frame" | "service-worker";
+        id?: string;
+        filePath: string;
+      }) => string;
+    }).registerPreloadScript;
+    if (typeof reg === "function") {
+      reg.call(s, { type: "frame", filePath: PRELOAD_PATH, id: "codex-plusplus" });
+      log("info", `preload registered (registerPreloadScript) on ${label}:`, PRELOAD_PATH);
+      return;
+    }
+    // Fallback for older Electron versions.
+    const existing = s.getPreloads();
+    if (!existing.includes(PRELOAD_PATH)) {
+      s.setPreloads([...existing, PRELOAD_PATH]);
+    }
+    log("info", `preload registered (setPreloads) on ${label}:`, PRELOAD_PATH);
+  } catch (e) {
+    if (e instanceof Error && e.message.includes("existing ID")) {
+      log("info", `preload already registered on ${label}:`, PRELOAD_PATH);
+      return;
+    }
+    log("error", `preload registration on ${label} failed:`, e);
+  }
+}
+
+app.whenReady().then(() => {
+  log("info", "app ready fired");
+  registerPreload(session.defaultSession, "defaultSession");
+});
+
+app.on("session-created", (s) => {
+  registerPreload(s, "session-created");
+});
+
+// DIAGNOSTIC: log every webContents creation. Useful for verifying our
+// preload reaches every renderer Codex spawns.
+app.on("web-contents-created", (_e, wc) => {
+  try {
+    const wp = (wc as unknown as { getLastWebPreferences?: () => Record<string, unknown> })
+      .getLastWebPreferences?.();
+    log("info", "web-contents-created", {
+      id: wc.id,
+      type: wc.getType(),
+      sessionIsDefault: wc.session === session.defaultSession,
+      sandbox: wp?.sandbox,
+      contextIsolation: wp?.contextIsolation,
+    });
+    wc.on("preload-error", (_ev, p, err) => {
+      log("error", `wc ${wc.id} preload-error path=${p}`, String(err?.stack ?? err));
+    });
+  } catch (e) {
+    log("error", "web-contents-created handler failed:", String((e as Error)?.stack ?? e));
+  }
+});
+
+log("info", "main.ts evaluated; app.isReady=" + app.isReady());
+
+// 2. Initial tweak discovery + main-scope load.
+loadAllMainTweaks();
+
+app.on("will-quit", () => {
+  stopAllMainTweaks();
+  // Best-effort flush of any pending storage writes.
+  for (const t of tweakState.loadedMain.values()) {
+    try {
+      t.storage.flush();
+    } catch {}
+  }
+});
+
+// 3. IPC: expose tweak metadata + reveal-in-finder.
+ipcMain.handle("codexpp:list-tweaks", () => {
+  return tweakState.discovered.map((t) => ({
+    manifest: t.manifest,
+    entry: t.entry,
+    dir: t.dir,
+    entryExists: existsSync(t.entry),
+    enabled: isTweakEnabled(t.manifest.id),
+  }));
+});
+
+ipcMain.handle("codexpp:get-tweak-enabled", (_e, id: string) => isTweakEnabled(id));
+ipcMain.handle("codexpp:set-tweak-enabled", (_e, id: string, enabled: boolean) => {
+  setTweakEnabled(id, !!enabled);
+  log("info", `tweak ${id} enabled=${!!enabled}`);
+  // Broadcast so renderer hosts re-evaluate which tweaks should be running.
+  broadcastReload();
+  return true;
+});
+
+// Sandboxed renderer preload can't use Node fs to read tweak source. Main
+// reads it on the renderer's behalf. Path must live under tweaksDir for
+// security — we refuse anything else.
+ipcMain.handle("codexpp:read-tweak-source", (_e, entryPath: string) => {
+  const resolved = resolve(entryPath);
+  if (!resolved.startsWith(TWEAKS_DIR + "/") && resolved !== TWEAKS_DIR) {
+    throw new Error("path outside tweaks dir");
+  }
+  return require("node:fs").readFileSync(resolved, "utf8");
+});
+
+/**
+ * Read an arbitrary asset file from inside a tweak's directory and return it
+ * as a `data:` URL. Used by the settings injector to render manifest icons
+ * (the renderer is sandboxed; `file://` won't load).
+ *
+ * Security: caller passes `tweakDir` and `relPath`; we (1) require tweakDir
+ * to live under TWEAKS_DIR, (2) resolve relPath against it and re-check the
+ * result still lives under TWEAKS_DIR, (3) cap output size at 1 MiB.
+ */
+const ASSET_MAX_BYTES = 1024 * 1024;
+const MIME_BY_EXT: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+};
+ipcMain.handle(
+  "codexpp:read-tweak-asset",
+  (_e, tweakDir: string, relPath: string) => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const dir = resolve(tweakDir);
+    if (!dir.startsWith(TWEAKS_DIR + "/")) {
+      throw new Error("tweakDir outside tweaks dir");
+    }
+    const full = resolve(dir, relPath);
+    if (!full.startsWith(dir + "/")) {
+      throw new Error("path traversal");
+    }
+    const stat = fs.statSync(full);
+    if (stat.size > ASSET_MAX_BYTES) {
+      throw new Error(`asset too large (${stat.size} > ${ASSET_MAX_BYTES})`);
+    }
+    const ext = full.slice(full.lastIndexOf(".")).toLowerCase();
+    const mime = MIME_BY_EXT[ext] ?? "application/octet-stream";
+    const buf = fs.readFileSync(full);
+    return `data:${mime};base64,${buf.toString("base64")}`;
+  },
+);
+
+// Sandboxed preload can't write logs to disk; forward to us via IPC.
+ipcMain.on("codexpp:preload-log", (_e, level: "info" | "warn" | "error", msg: string) => {
+  const lvl = level === "error" || level === "warn" ? level : "info";
+  try {
+    appendFileSync(
+      join(LOG_DIR, "preload.log"),
+      `[${new Date().toISOString()}] [${lvl}] ${msg}\n`,
+    );
+  } catch {}
+});
+
+// Sandbox-safe filesystem ops for renderer-scope tweaks. Each tweak gets
+// a sandboxed dir under userRoot/tweak-data/<id>. Renderer side calls these
+// over IPC instead of using Node fs directly.
+ipcMain.handle("codexpp:tweak-fs", (_e, op: string, id: string, p: string, c?: string) => {
+  if (!/^[a-zA-Z0-9._-]+$/.test(id)) throw new Error("bad tweak id");
+  if (p.includes("..")) throw new Error("path traversal");
+  const dir = join(userRoot!, "tweak-data", id);
+  mkdirSync(dir, { recursive: true });
+  const full = join(dir, p);
+  const fs = require("node:fs") as typeof import("node:fs");
+  switch (op) {
+    case "read": return fs.readFileSync(full, "utf8");
+    case "write": return fs.writeFileSync(full, c ?? "", "utf8");
+    case "exists": return fs.existsSync(full);
+    case "dataDir": return dir;
+    default: throw new Error(`unknown op: ${op}`);
+  }
+});
+
+ipcMain.handle("codexpp:user-paths", () => ({
+  userRoot,
+  runtimeDir,
+  tweaksDir: TWEAKS_DIR,
+  logDir: LOG_DIR,
+}));
+
+ipcMain.handle("codexpp:reveal", (_e, p: string) => {
+  shell.openPath(p).catch(() => {});
+});
+
+// Manual force-reload trigger from the renderer (e.g. the "Force Reload"
+// button on our injected Tweaks page). Bypasses the watcher debounce.
+ipcMain.handle("codexpp:reload-tweaks", () => {
+  log("info", "reloading tweaks (manual)");
+  stopAllMainTweaks();
+  clearTweakModuleCache();
+  loadAllMainTweaks();
+  broadcastReload();
+  return { at: Date.now(), count: tweakState.discovered.length };
+});
+
+// 4. Filesystem watcher → debounced reload + broadcast.
+//    We watch the tweaks dir for any change. On the first tick of inactivity
+//    we stop main-side tweaks, clear their cached modules, re-discover, then
+//    restart and broadcast `codexpp:tweaks-changed` to every renderer so it
+//    can re-init its host.
+const RELOAD_DEBOUNCE_MS = 250;
+let reloadTimer: NodeJS.Timeout | null = null;
+function scheduleReload(reason: string): void {
+  if (reloadTimer) clearTimeout(reloadTimer);
+  reloadTimer = setTimeout(() => {
+    reloadTimer = null;
+    log("info", `reloading tweaks (${reason})`);
+    stopAllMainTweaks();
+    clearTweakModuleCache();
+    loadAllMainTweaks();
+    broadcastReload();
+  }, RELOAD_DEBOUNCE_MS);
+}
+
+try {
+  const watcher = chokidar.watch(TWEAKS_DIR, {
+    ignoreInitial: true,
+    // Wait for files to settle before triggering — guards against partially
+    // written tweak files during editor saves / git checkouts.
+    awaitWriteFinish: { stabilityThreshold: 150, pollInterval: 50 },
+    // Avoid eating CPU on huge node_modules trees inside tweak folders.
+    ignored: (p) => p.includes(`${TWEAKS_DIR}/`) && /\/node_modules\//.test(p),
+  });
+  watcher.on("all", (event, path) => scheduleReload(`${event} ${path}`));
+  watcher.on("error", (e) => log("warn", "watcher error:", e));
+  log("info", "watching", TWEAKS_DIR);
+  app.on("will-quit", () => watcher.close().catch(() => {}));
+} catch (e) {
+  log("error", "failed to start watcher:", e);
+}
+
+// --- helpers ---
+
+function loadAllMainTweaks(): void {
+  try {
+    tweakState.discovered = discoverTweaks(TWEAKS_DIR);
+    log(
+      "info",
+      `discovered ${tweakState.discovered.length} tweak(s):`,
+      tweakState.discovered.map((t) => t.manifest.id).join(", "),
+    );
+  } catch (e) {
+    log("error", "tweak discovery failed:", e);
+    tweakState.discovered = [];
+  }
+
+  for (const t of tweakState.discovered) {
+    if (t.manifest.scope === "renderer") continue;
+    if (!isTweakEnabled(t.manifest.id)) {
+      log("info", `skipping disabled main tweak: ${t.manifest.id}`);
+      continue;
+    }
+    try {
+      const mod = require(t.entry);
+      const tweak = mod.default ?? mod;
+      if (typeof tweak?.start === "function") {
+        const storage = createDiskStorage(userRoot!, t.manifest.id);
+        tweak.start({
+          manifest: t.manifest,
+          process: "main",
+          log: makeLogger(t.manifest.id),
+          storage,
+          ipc: makeMainIpc(t.manifest.id),
+          fs: makeMainFs(t.manifest.id),
+        });
+        tweakState.loadedMain.set(t.manifest.id, {
+          stop: tweak.stop,
+          storage,
+        });
+        log("info", `started main tweak: ${t.manifest.id}`);
+      }
+    } catch (e) {
+      log("error", `tweak ${t.manifest.id} failed to start:`, e);
+    }
+  }
+}
+
+function stopAllMainTweaks(): void {
+  for (const [id, t] of tweakState.loadedMain) {
+    try {
+      t.stop?.();
+      t.storage.flush();
+      log("info", `stopped main tweak: ${id}`);
+    } catch (e) {
+      log("warn", `stop failed for ${id}:`, e);
+    }
+  }
+  tweakState.loadedMain.clear();
+}
+
+function clearTweakModuleCache(): void {
+  // Drop any cached require() entries that live inside the tweaks dir so a
+  // re-require on next load picks up fresh code. We do prefix matching on
+  // the resolved tweaks dir.
+  const prefix = TWEAKS_DIR + (TWEAKS_DIR.endsWith("/") ? "" : "/");
+  for (const key of Object.keys(require.cache)) {
+    if (key.startsWith(prefix)) delete require.cache[key];
+  }
+}
+
+function broadcastReload(): void {
+  const payload = {
+    at: Date.now(),
+    tweaks: tweakState.discovered.map((t) => t.manifest.id),
+  };
+  for (const wc of webContents.getAllWebContents()) {
+    try {
+      wc.send("codexpp:tweaks-changed", payload);
+    } catch (e) {
+      log("warn", "broadcast send failed:", e);
+    }
+  }
+}
+
+function makeLogger(scope: string) {
+  return {
+    debug: (...a: unknown[]) => log("info", `[${scope}]`, ...a),
+    info: (...a: unknown[]) => log("info", `[${scope}]`, ...a),
+    warn: (...a: unknown[]) => log("warn", `[${scope}]`, ...a),
+    error: (...a: unknown[]) => log("error", `[${scope}]`, ...a),
+  };
+}
+
+function makeMainIpc(id: string) {
+  const ch = (c: string) => `codexpp:${id}:${c}`;
+  return {
+    on: (c: string, h: (...args: unknown[]) => void) => {
+      const wrapped = (_e: unknown, ...args: unknown[]) => h(...args);
+      ipcMain.on(ch(c), wrapped);
+      return () => ipcMain.removeListener(ch(c), wrapped as never);
+    },
+    send: (_c: string) => {
+      throw new Error("ipc.send is renderer→main; main side uses handle/on");
+    },
+    invoke: (_c: string) => {
+      throw new Error("ipc.invoke is renderer→main; main side uses handle");
+    },
+    handle: (c: string, handler: (...args: unknown[]) => unknown) => {
+      ipcMain.handle(ch(c), (_e: unknown, ...args: unknown[]) => handler(...args));
+    },
+  };
+}
+
+function makeMainFs(id: string) {
+  const dir = join(userRoot!, "tweak-data", id);
+  mkdirSync(dir, { recursive: true });
+  const fs = require("node:fs/promises") as typeof import("node:fs/promises");
+  return {
+    dataDir: dir,
+    read: (p: string) => fs.readFile(join(dir, p), "utf8"),
+    write: (p: string, c: string) => fs.writeFile(join(dir, p), c, "utf8"),
+    exists: async (p: string) => {
+      try {
+        await fs.access(join(dir, p));
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
+// Touch BrowserWindow to keep its import — older Electron lint rules.
+void BrowserWindow;

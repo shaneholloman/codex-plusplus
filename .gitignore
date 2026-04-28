@@ -1,0 +1,16 @@
+node_modules
+dist
+build
+*.log
+.DS_Store
+.vscode
+.idea
+*.tsbuildinfo
+coverage
+.env
+.env.*
+!.env.example
+
+# installer artifacts (local testing)
+/tmp-extract
+/tmp-codex
