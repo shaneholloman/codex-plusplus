@@ -15,6 +15,11 @@
  *                          "Resets: HH:MM". Red when <15% remaining.
  *                          Sources data from the expanded rate-limits
  *                          breakdown opened from the account menu.
+ *  • square-sidebar        Flatten the rounded seam between sidebar and
+ *                          main content panel.
+ *  • match-sidebar-width   Force the settings page sidebar to match the
+ *                          main UI sidebar's width, eliminating the
+ *                          layout jump when opening/closing Settings.
  *
  * Authoring notes
  * ---------------
@@ -34,6 +39,7 @@ module.exports = {
         "hide-upgrade-prompts": true,
         "show-usage-in-sidebar": false,
         "square-sidebar": false,
+        "match-sidebar-width": true,
       },
     };
     this._state = state;
@@ -110,6 +116,12 @@ function renderSettings(root, state) {
       title: "Square sidebar corners",
       description:
         "Remove the rounded inner corners on the main content panel so it sits flush against the sidebar.",
+    },
+    {
+      id: "match-sidebar-width",
+      title: "Match settings sidebar width",
+      description:
+        "Stop the layout jump when opening Settings: the settings sidebar (fixed at 300px) is forced to match the main UI sidebar's current width.",
     },
   ];
 
@@ -608,6 +620,99 @@ const FEATURES = {
     document.head.appendChild(style);
 
     return () => {
+      style.remove();
+    };
+  },
+
+  /**
+   * Match settings sidebar width to the main UI sidebar.
+   *
+   * Codex's main UI sidebar is `<aside class="pointer-events-auto relative
+   * flex overflow-hidden">` — JS-controlled, user-resizable, width set via
+   * inline `style="width: NNNpx"`. The settings page sidebar is a separate
+   * element `<div class="window-fx-sidebar-surface ... w-token-sidebar">`
+   * which uses Tailwind class `w-token-sidebar` → `width:
+   * var(--spacing-token-sidebar)` ≈ 300px regardless of the main UI's
+   * current width. That mismatch causes a visible layout jump every time
+   * Settings opens or closes.
+   *
+   * Strategy: watch the main UI aside via ResizeObserver, persist the
+   * latest pixel width to `api.storage`, and apply it to the settings
+   * sidebar via an injected stylesheet. We seed from storage on start so
+   * the very first paint of the settings page is already correct, before
+   * the user has visited the main UI in this session.
+   */
+  "match-sidebar-width"(api) {
+    const STYLE_ID = "codexpp-match-sidebar-width";
+    const STORAGE_KEY = "match-sidebar-width:last";
+    const ASIDE_SELECTOR =
+      "aside.pointer-events-auto.relative.flex.overflow-hidden";
+    const SETTINGS_SIDEBAR_SELECTOR =
+      ".window-fx-sidebar-surface.w-token-sidebar";
+
+    document.getElementById(STYLE_ID)?.remove();
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    document.head.appendChild(style);
+
+    function applyWidth(px) {
+      // Sanity-clamp; ignore zero/negative/absurd values that could be
+      // observed mid-mount or during a transition.
+      if (!Number.isFinite(px) || px < 120 || px > 900) return;
+      // Override only the settings page sidebar. Main UI's <aside> sets
+      // its own inline width — we mustn't touch it. Use !important to win
+      // against the `w-token-sidebar` utility.
+      style.textContent =
+        `${SETTINGS_SIDEBAR_SELECTOR} { width: ${px}px !important; }`;
+    }
+
+    // Seed from last-known so the first settings-page paint matches.
+    const seeded = Number(api.storage.get(STORAGE_KEY, NaN));
+    if (Number.isFinite(seeded)) applyWidth(seeded);
+
+    let resizeObs = null;
+    let observed = null;
+
+    function track(aside) {
+      if (observed === aside) return;
+      if (resizeObs) {
+        resizeObs.disconnect();
+        resizeObs = null;
+      }
+      observed = aside;
+      if (!aside) return;
+      // Pick up the current width immediately, then observe.
+      const initial = Math.round(aside.getBoundingClientRect().width);
+      if (initial > 0) {
+        api.storage.set(STORAGE_KEY, initial);
+        applyWidth(initial);
+      }
+      resizeObs = new ResizeObserver((entries) => {
+        const entry = entries[0];
+        if (!entry) return;
+        const w = Math.round(
+          entry.contentRect?.width ?? aside.getBoundingClientRect().width,
+        );
+        if (w <= 0) return;
+        api.storage.set(STORAGE_KEY, w);
+        applyWidth(w);
+      });
+      resizeObs.observe(aside);
+    }
+
+    // Settings and main UI are mutually exclusive — when navigating
+    // between them, the aside is mounted/unmounted. Watch the body for
+    // structural changes and re-bind whenever a new aside appears.
+    track(document.querySelector(ASIDE_SELECTOR));
+    const mut = new MutationObserver(() => {
+      const a = document.querySelector(ASIDE_SELECTOR);
+      if (a !== observed) track(a);
+    });
+    mut.observe(document.body, { childList: true, subtree: true });
+
+    return () => {
+      mut.disconnect();
+      if (resizeObs) resizeObs.disconnect();
       style.remove();
     };
   },
