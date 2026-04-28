@@ -33,6 +33,7 @@ module.exports = {
       defaults: {
         "hide-upgrade-prompts": true,
         "show-usage-in-sidebar": false,
+        "square-sidebar": false,
       },
     };
     this._state = state;
@@ -104,6 +105,12 @@ function renderSettings(root, state) {
       description:
         "Render 5-hour and weekly rate limits where the upgrade button was. Open the rate-limits breakdown (account menu → Rate limits) at least once to seed the values.",
     },
+    {
+      id: "square-sidebar",
+      title: "Square sidebar corners",
+      description:
+        "Remove the rounded inner corners on the main content panel so it sits flush against the sidebar.",
+    },
   ];
 
   const section = el("section", "flex flex-col gap-2");
@@ -115,6 +122,130 @@ function renderSettings(root, state) {
   }
   section.appendChild(card);
   root.appendChild(section);
+
+  // ── Debug ─────────────────────────────────────────────────────────────
+  // Quick utilities for iterating on tweaks. The "Dump sidebar DOM" button
+  // walks the document for the left-edge sidebar element and writes its
+  // outerHTML (plus a few candidate selectors) somewhere we can read. This
+  // is how we figure out which classes to target for new tweaks.
+  const debug = el("section", "flex flex-col gap-2 mt-4");
+  debug.appendChild(sectionTitle("Debug"));
+  const debugCard = roundedCard();
+  debugCard.appendChild(dumpSidebarRow(state));
+  debug.appendChild(debugCard);
+  root.appendChild(debug);
+}
+
+function dumpSidebarRow(state) {
+  const row = el("div", "flex items-center justify-between gap-4 p-3");
+  const left = el("div", "flex min-w-0 flex-col gap-1");
+  const label = el("div", "min-w-0 text-sm text-token-text-primary");
+  label.textContent = "Dump sidebar DOM";
+  const desc = el("div", "text-token-text-secondary min-w-0 text-sm");
+  desc.textContent =
+    "Copy the sidebar's HTML to the clipboard and write it to sidebar-dump.html for inspection.";
+  left.append(label, desc);
+  row.appendChild(left);
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className =
+    "h-token-button-composer rounded-md border border-token-border " +
+    "bg-token-foreground/5 hover:bg-token-foreground/10 px-3 text-sm " +
+    "text-token-text-primary cursor-interaction";
+  btn.textContent = "Dump";
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "Dumping…";
+    try {
+      const result = await dumpSidebar(state.api);
+      btn.textContent = result.ok ? "Copied ✓" : "Failed";
+      state.api.log.info("sidebar dump", result);
+    } catch (e) {
+      btn.textContent = "Error";
+      state.api.log.error("dump failed", e);
+    } finally {
+      setTimeout(() => {
+        btn.textContent = "Dump";
+        btn.disabled = false;
+      }, 1500);
+    }
+  });
+  row.appendChild(btn);
+  return row;
+}
+
+/**
+ * Heuristic sidebar finder. Codex's left rail is typically a flex column
+ * pinned to x=0 with substantial height. We rank candidates by:
+ *   • bounding-rect.left near 0
+ *   • height > 60% of viewport
+ *   • narrow-ish width (< 360px) for collapsed/expanded sidebars
+ *   • presence of `nav` or aria-label="Primary"
+ * and pick the best. Returns the chosen element + a few selector hints.
+ */
+async function dumpSidebar(api) {
+  const candidates = [];
+  const all = document.querySelectorAll(
+    'aside, nav, [role="navigation"], [data-testid*="sidebar" i], div',
+  );
+  const vh = window.innerHeight;
+  for (const el of all) {
+    const r = el.getBoundingClientRect();
+    if (r.left > 8) continue;
+    if (r.height < vh * 0.6) continue;
+    if (r.width < 40 || r.width > 420) continue;
+    let score = 0;
+    if (el.tagName === "ASIDE" || el.tagName === "NAV") score += 5;
+    if (el.getAttribute("role") === "navigation") score += 3;
+    if (el.querySelector("nav")) score += 1;
+    if (/sidebar/i.test(el.getAttribute("data-testid") || "")) score += 4;
+    if (/rounded/.test(el.className || "")) score += 2;
+    score += Math.max(0, 200 - r.width) / 100; // prefer narrower
+    candidates.push({ el, score, rect: r });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  const top = candidates[0];
+  if (!top) return { ok: false, reason: "no candidate" };
+
+  const html = top.el.outerHTML;
+  const summary = candidates.slice(0, 5).map((c) => ({
+    tag: c.el.tagName.toLowerCase(),
+    classes: c.el.className,
+    rect: {
+      x: Math.round(c.rect.left),
+      y: Math.round(c.rect.top),
+      w: Math.round(c.rect.width),
+      h: Math.round(c.rect.height),
+    },
+    score: c.score,
+  }));
+
+  const payload =
+    `<!-- top candidates (best first) -->\n` +
+    summary.map((s) => "<!-- " + JSON.stringify(s) + " -->").join("\n") +
+    `\n\n<!-- chosen element outerHTML -->\n` +
+    html;
+
+  let wrotePath = null;
+  try {
+    if (typeof api.fs?.write === "function") {
+      await api.fs.write("sidebar-dump.html", payload);
+      wrotePath = "sidebar-dump.html (in tweak data dir)";
+    }
+  } catch (e) {
+    api.log.warn("fs.write failed", e);
+  }
+
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(payload);
+    copied = true;
+  } catch (e) {
+    api.log.warn("clipboard write failed", e);
+  }
+
+  return { ok: true, copied, wrotePath, summary };
 }
 
 function featureRow(state, f) {
@@ -449,6 +580,35 @@ const FEATURES = {
         mounted.remove();
         mounted = null;
       }
+    };
+  },
+
+  /**
+   * Square sidebar: the visual "rounded sidebar" is actually the main
+   * content panel — `<main class="main-surface ... rounded-s-2xl">` —
+   * which has `border-radius: 12.5px 0 0 12.5px` (TL+BL via Tailwind's
+   * logical `rounded-s-2xl`). Its rounded left edge curves into the
+   * sidebar, making the sidebar's TR+BR corners *appear* rounded.
+   * Flattening `.main-surface`'s left side squares the seam.
+   */
+  "square-sidebar"() {
+    const STYLE_ID = "codexpp-square-sidebar";
+    document.getElementById(STYLE_ID)?.remove();
+
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      /* Flatten the main panel's left (logical-start) corners.
+         Codex applies these via Tailwind's rounded-s-2xl utility. */
+      .main-surface {
+        border-start-start-radius: 0 !important;
+        border-end-start-radius: 0 !important;
+      }
+    `;
+    document.head.appendChild(style);
+
+    return () => {
+      style.remove();
     };
   },
 };

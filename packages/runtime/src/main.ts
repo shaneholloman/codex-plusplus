@@ -32,6 +32,22 @@ const STATE_FILE = join(userRoot, "state.json");
 mkdirSync(LOG_DIR, { recursive: true });
 mkdirSync(TWEAKS_DIR, { recursive: true });
 
+// Optional: enable Chrome DevTools Protocol on a TCP port so we can drive the
+// running Codex from outside (curl http://localhost:<port>/json, attach via
+// CDP WebSocket, take screenshots, evaluate in renderer, etc.). Codex's
+// production build sets webPreferences.devTools=false, which kills the
+// in-window DevTools shortcut, but `--remote-debugging-port` works regardless
+// because it's a Chromium command-line switch processed before app init.
+//
+// Off by default. Set CODEXPP_REMOTE_DEBUG=1 (optionally CODEXPP_REMOTE_DEBUG_PORT)
+// to turn it on. Must be appended before `app` becomes ready; we're at module
+// top-level so that's fine.
+if (process.env.CODEXPP_REMOTE_DEBUG === "1") {
+  const port = process.env.CODEXPP_REMOTE_DEBUG_PORT ?? "9222";
+  app.commandLine.appendSwitch("remote-debugging-port", port);
+  log("info", `remote debugging enabled on port ${port}`);
+}
+
 interface PersistedState {
   /** Per-tweak enable flags. Missing entries default to enabled. */
   tweaks?: Record<string, { enabled?: boolean }>;
