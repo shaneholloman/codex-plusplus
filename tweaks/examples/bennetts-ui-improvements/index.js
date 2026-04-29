@@ -1127,7 +1127,11 @@ const FEATURES = {
       "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 " +
       "focus-visible:outline-token-border cursor-interaction";
     const actions = [
-      { key: "new chat", aliases: ["new chat"], label: "New chat" },
+      {
+        key: "new chat",
+        aliases: ["new chat", "quick chat"],
+        label: "New chat",
+      },
       { key: "search", aliases: ["search"], label: "Search" },
       { key: "plugins", aliases: ["plugin", "plugins"], label: "Plugins" },
       { key: "automations", aliases: ["automation", "automations"], label: "Automations" },
@@ -1546,7 +1550,13 @@ const FEATURES = {
     clearStaleNodes();
     apply();
     const obs = new MutationObserver(scheduleApply);
-    obs.observe(document.body, { childList: true, subtree: true });
+    obs.observe(document.body, {
+      attributes: true,
+      attributeFilter: ["aria-label", "title"],
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
 
     api.log.info("sidebar action grid active");
 
